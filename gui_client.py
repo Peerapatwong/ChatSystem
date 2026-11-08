@@ -103,6 +103,106 @@ class SocketClient:
             self.events.put(("disconnected", None))
 
 
+class ConversationWindow(tk.Toplevel):
+    """One classic chat window for a user, group, Gemini, or the server log."""
+
+    def __init__(self, owner, kind: str, name: str) -> None:
+        super().__init__(owner)
+        self.owner = owner
+        self.kind = kind
+        self.name = name
+        self.title(f"{name} - {APP_NAME}")
+        self.geometry("610x430")
+        self.minsize(420, 280)
+        self.configure(bg=owner.BG)
+        self.message_var = tk.StringVar()
+
+        menu = tk.Menu(self, tearoff=False, font=("MS Sans Serif", 9))
+        file_menu = tk.Menu(menu, tearoff=False)
+        if kind in {"user", "group"}:
+            file_menu.add_command(label="Send file...", command=self._send_file)
+        if kind == "gemini":
+            file_menu.add_command(label="Summarize PDF...", command=owner._summarize_pdf)
+            file_menu.add_command(label="Generate image...", command=owner._generate_image)
+        if kind in {"user", "group", "gemini"}:
+            file_menu.add_separator()
+        file_menu.add_command(label="Close", command=self._close, accelerator="Ctrl+W")
+        menu.add_cascade(label="File", menu=file_menu)
+        if kind == "group":
+            group_menu = tk.Menu(menu, tearoff=False)
+            group_menu.add_command(label="List shared files", command=self._list_group_files)
+            group_menu.add_command(label="Leave group", command=lambda: owner._leave_named_group(name))
+            menu.add_cascade(label="Group", menu=group_menu)
+        edit_menu = tk.Menu(menu, tearoff=False)
+        edit_menu.add_command(label="Clear transcript", command=self.clear)
+        menu.add_cascade(label="Edit", menu=edit_menu)
+        self.config(menu=menu)
+
+        header_text = {
+            "user": f"Private conversation with {name}",
+            "group": f"Group conversation: {name}",
+            "gemini": "Gemini — chat, summarize PDFs, or generate images",
+            "server": "Server messages and connection activity",
+        }[kind]
+        ttk.Label(self, text=header_text, anchor="w").pack(fill="x", padx=8, pady=(8, 3))
+
+        transcript_frame = ttk.Frame(self)
+        transcript_frame.pack(fill="both", expand=True, padx=8, pady=3)
+        self.transcript = tk.Text(
+            transcript_frame, wrap="word", state="disabled", bg=owner.LIGHT,
+            fg="#000000", relief="sunken", bd=2, font=("Fixedsys", 10),
+            padx=6, pady=6, selectbackground=owner.NAVY,
+        )
+        scroll = ttk.Scrollbar(transcript_frame, command=self.transcript.yview)
+        self.transcript.configure(yscrollcommand=scroll.set)
+        self.transcript.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        self.transcript.tag_configure("system", foreground="#000080")
+        self.transcript.tag_configure("error", foreground="#800000")
+        self.transcript.tag_configure("self", foreground="#008000")
+        self.transcript.tag_configure("heading", font=("Fixedsys", 10, "bold"))
+
+        if kind != "server":
+            composer = ttk.LabelFrame(self, text="Message", padding=7)
+            composer.pack(fill="x", padx=8, pady=(3, 8))
+            self.entry = ttk.Entry(composer, textvariable=self.message_var)
+            self.entry.pack(side="left", fill="x", expand=True, padx=(0, 7))
+            ttk.Button(composer, text="Send", command=self._send).pack(side="right")
+            self.entry.bind("<Return>", lambda _e: self._send())
+            self.after(50, self.entry.focus_set)
+
+        self.bind("<Control-w>", lambda _e: self._close())
+        self.protocol("WM_DELETE_WINDOW", self._close)
+
+    def append(self, text: str, tag: str | None = None) -> None:
+        self.transcript.configure(state="normal")
+        self.transcript.insert("end", text, tag or ())
+        self.transcript.see("end")
+        self.transcript.configure(state="disabled")
+        if self.state() == "iconic":
+            self.deiconify()
+
+    def clear(self) -> None:
+        self.transcript.configure(state="normal")
+        self.transcript.delete("1.0", "end")
+        self.transcript.configure(state="disabled")
+
+    def _send(self) -> None:
+        message = self.message_var.get().strip()
+        if message and self.owner._send_conversation_message(self.kind, self.name, message):
+            self.message_var.set("")
+
+    def _send_file(self) -> None:
+        self.owner._send_file_to(self.kind, self.name)
+
+    def _list_group_files(self) -> None:
+        self.owner._list_named_group_files(self.name)
+
+    def _close(self) -> None:
+        self.owner._conversation_closed(self.kind, self.name)
+        self.destroy()
+
+
 class ChatWindow(tk.Tk):
     BG = "#c0c0c0"
     LIGHT = "#ffffff"
@@ -112,8 +212,8 @@ class ChatWindow(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("920x620")
-        self.minsize(700, 460)
+        self.geometry("560x520")
+        self.minsize(470, 390)
         self.configure(bg=self.BG)
 
         self.events: queue.Queue = queue.Queue()
@@ -121,12 +221,11 @@ class ChatWindow(tk.Tk):
         self.username = ""
         self.pending_downloads: dict[tuple[str, str | None], Path] = {}
         self.active_files_group: str | None = None
+        self.conversations: dict[tuple[str, str], ConversationWindow] = {}
 
         self.host_var = tk.StringVar(value=DEFAULT_HOST)
         self.port_var = tk.StringVar(value=str(DEFAULT_PORT))
         self.user_var = tk.StringVar()
-        self.target_var = tk.StringVar(value="Server")
-        self.message_var = tk.StringVar()
         self.status_var = tk.StringVar(value="Not connected")
 
         self._configure_style()
@@ -134,6 +233,7 @@ class ChatWindow(tk.Tk):
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._quit)
         self.after(75, self._drain_events)
+        self.after(5000, self._auto_refresh_contacts)
 
     def _configure_style(self) -> None:
         style = ttk.Style(self)
@@ -164,9 +264,10 @@ class ChatWindow(tk.Tk):
         chat_menu = tk.Menu(menu, tearoff=False)
         chat_menu.add_command(label="Message selected user", command=self._select_user)
         chat_menu.add_command(label="Message selected group", command=self._select_group)
+        chat_menu.add_command(label="Open Gemini", command=self._open_gemini)
+        chat_menu.add_command(label="Open server log", command=self._open_server_log)
         chat_menu.add_separator()
         chat_menu.add_command(label="Refresh lists", command=self._refresh_all, accelerator="F5")
-        chat_menu.add_command(label="Clear transcript", command=self._clear_transcript)
         menu.add_cascade(label="Chat", menu=chat_menu)
 
         group_menu = tk.Menu(menu, tearoff=False)
@@ -177,7 +278,7 @@ class ChatWindow(tk.Tk):
         menu.add_cascade(label="Groups", menu=group_menu)
 
         tools_menu = tk.Menu(menu, tearoff=False)
-        tools_menu.add_command(label="Ask Gemini", command=lambda: self.target_var.set("Gemini"))
+        tools_menu.add_command(label="Gemini chat", command=self._open_gemini)
         tools_menu.add_command(label="Summarize PDF...", command=self._summarize_pdf)
         tools_menu.add_command(label="Generate image...", command=self._generate_image)
         menu.add_cascade(label="Tools", menu=tools_menu)
@@ -198,21 +299,30 @@ class ChatWindow(tk.Tk):
         ttk.Entry(connection, textvariable=self.host_var, width=18).grid(row=0, column=1, padx=(3, 10))
         ttk.Label(connection, text="Port:").grid(row=0, column=2, sticky="w")
         ttk.Entry(connection, textvariable=self.port_var, width=7).grid(row=0, column=3, padx=(3, 10))
-        ttk.Label(connection, text="User name:").grid(row=0, column=4, sticky="w")
+        ttk.Label(connection, text="User name:").grid(row=1, column=0, sticky="w", pady=(6, 0))
         self.user_entry = ttk.Entry(connection, textvariable=self.user_var, width=18)
-        self.user_entry.grid(row=0, column=5, padx=(3, 10))
+        self.user_entry.grid(row=1, column=1, padx=(3, 10), pady=(6, 0), sticky="ew")
         self.connect_button = ttk.Button(connection, text="Connect", command=self._toggle_connection)
-        self.connect_button.grid(row=0, column=6)
-        connection.columnconfigure(7, weight=1)
+        self.connect_button.grid(row=1, column=3, pady=(6, 0), sticky="e")
+        connection.columnconfigure(1, weight=1)
         self.user_entry.bind("<Return>", lambda _e: self._toggle_connection())
 
-        pane = ttk.Panedwindow(self, orient="horizontal")
-        pane.pack(fill="both", expand=True, padx=8, pady=4)
+        hub_bar = ttk.Frame(self)
+        hub_bar.pack(fill="x", padx=8, pady=(4, 2))
+        hint = tk.Label(
+            hub_bar,
+            text="Double-click a user or group to open its own chat window.\n"
+                 "Server and Gemini are available from the Chat menu.",
+            justify="left", anchor="w", bg=self.BG, font=("MS Sans Serif", 9),
+        )
+        hint.pack(side="left", fill="x", expand=True, padx=2)
+        self.refresh_button = ttk.Button(
+            hub_bar, text="Refresh", command=self._refresh_contacts, state="disabled"
+        )
+        self.refresh_button.pack(side="right", padx=(8, 0))
 
-        sidebar = ttk.Frame(pane, width=220)
-        pane.add(sidebar, weight=0)
-        self.notebook = ttk.Notebook(sidebar)
-        self.notebook.pack(fill="both", expand=True)
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill="both", expand=True, padx=8, pady=4)
         self.users_list = self._add_list_tab("Users")
         self.groups_list = self._add_list_tab("Groups")
         self.files_list = self._add_list_tab("Files")
@@ -222,42 +332,11 @@ class ChatWindow(tk.Tk):
         for widget in (self.users_list, self.groups_list, self.files_list):
             widget.bind("<Button-3>", self._show_context_menu)
 
-        transcript_frame = ttk.LabelFrame(pane, text="Conversation", padding=5)
-        pane.add(transcript_frame, weight=1)
-        self.transcript = tk.Text(
-            transcript_frame, wrap="word", state="disabled", bg=self.LIGHT,
-            fg="#000000", relief="sunken", bd=2, font=("Fixedsys", 10),
-            padx=6, pady=6, selectbackground=self.NAVY,
-        )
-        scroll = ttk.Scrollbar(transcript_frame, command=self.transcript.yview)
-        self.transcript.configure(yscrollcommand=scroll.set)
-        self.transcript.pack(side="left", fill="both", expand=True)
-        scroll.pack(side="right", fill="y")
-        self.transcript.tag_configure("system", foreground="#000080")
-        self.transcript.tag_configure("error", foreground="#800000")
-        self.transcript.tag_configure("self", foreground="#008000")
-        self.transcript.tag_configure("heading", font=("Fixedsys", 10, "bold"))
-
-        composer = ttk.LabelFrame(self, text="Message", padding=7)
-        composer.pack(fill="x", padx=8, pady=4)
-        ttk.Label(composer, text="To:").grid(row=0, column=0, sticky="w")
-        self.target_box = ttk.Combobox(
-            composer, textvariable=self.target_var, state="readonly", width=23,
-            values=("Server", "Gemini"),
-        )
-        self.target_box.grid(row=0, column=1, padx=(3, 8), sticky="ew")
-        self.message_entry = ttk.Entry(composer, textvariable=self.message_var)
-        self.message_entry.grid(row=0, column=2, sticky="ew", padx=(0, 8))
-        ttk.Button(composer, text="Send", command=self._send_message).grid(row=0, column=3)
-        composer.columnconfigure(2, weight=1)
-        self.message_entry.bind("<Return>", lambda _e: self._send_message())
-
         status = tk.Label(
             self, textvariable=self.status_var, anchor="w", relief="sunken", bd=1,
             bg=self.BG, font=("MS Sans Serif", 9), padx=5,
         )
         status.pack(fill="x", side="bottom", padx=8, pady=(0, 6))
-        self._write("NetworkSocket GUI ready. Enter connection details and click Connect.\n", "system")
         self.user_entry.focus_set()
 
     def _add_list_tab(self, name: str) -> tk.Listbox:
@@ -282,17 +361,15 @@ class ChatWindow(tk.Tk):
             widget.selection_set(index)
         popup = tk.Menu(self, tearoff=False)
         if widget is self.users_list:
-            self._select_user()
             popup.add_command(label="Message", command=self._select_user)
-            popup.add_command(label="Send file...", command=self._send_file)
+            popup.add_command(label="Send file...", command=lambda: self._send_file_to_selected("user"))
         elif widget is self.groups_list:
-            self._select_group()
             popup.add_command(label="Message", command=self._select_group)
             popup.add_command(label="Join", command=self._join_group)
             popup.add_command(label="Leave", command=self._leave_group)
             popup.add_separator()
             popup.add_command(label="List files", command=self._list_group_files)
-            popup.add_command(label="Send file...", command=self._send_file)
+            popup.add_command(label="Send file...", command=lambda: self._send_file_to_selected("group"))
         else:
             popup.add_command(label="Download...", command=self._download_file)
             popup.add_command(label="Reject / remove", command=self._remove_file)
@@ -327,15 +404,15 @@ class ChatWindow(tk.Tk):
 
     def _set_connected(self) -> None:
         self.connect_button.configure(text="Disconnect", state="normal")
+        self.refresh_button.configure(state="normal")
         self.status_var.set(f"Connected as {self.username} to {self.host_var.get()}:{self.port_var.get()}")
         self._write(f"Connected as {self.username}.\n", "system")
         self._refresh_all()
-        self.message_entry.focus_set()
 
     def _set_disconnected(self, message: str) -> None:
         self.connect_button.configure(text="Connect", state="normal")
+        self.refresh_button.configure(state="disabled")
         self.status_var.set(message)
-        self.target_var.set("Server")
 
     def _selected(self, box: tk.Listbox) -> str | None:
         selection = box.curselection()
@@ -344,44 +421,65 @@ class ChatWindow(tk.Tk):
     def _select_user(self) -> None:
         name = self._selected(self.users_list)
         if name:
-            self.target_var.set(f"User: {name}")
-            self.message_entry.focus_set()
+            self._open_conversation("user", name)
 
     def _select_group(self) -> None:
         name = self._selected(self.groups_list)
         if name:
-            self.target_var.set(f"Group: {name}")
-            self.message_entry.focus_set()
+            self._open_conversation("group", name)
 
-    def _send_message(self) -> None:
-        message = self.message_var.get().strip()
-        target = self.target_var.get()
-        if not message:
-            return
+    def _open_conversation(self, kind: str, name: str) -> ConversationWindow:
+        key = (kind, name)
+        window = self.conversations.get(key)
+        if window is None or not window.winfo_exists():
+            window = ConversationWindow(self, kind, name)
+            self.conversations[key] = window
+        else:
+            window.deiconify()
+            window.lift()
+        return window
+
+    def _conversation_closed(self, kind: str, name: str) -> None:
+        self.conversations.pop((kind, name), None)
+
+    def _open_gemini(self) -> None:
+        self._open_conversation("gemini", "Gemini")
+
+    def _open_server_log(self) -> None:
+        self._open_conversation("server", "Server")
+
+    def _send_conversation_message(self, kind: str, name: str, message: str) -> bool:
         if not self.client.connected:
             messagebox.showwarning("Send", "Connect to a server first.")
-            return
-        if target.startswith("User: "):
-            name = target[6:]
-            if self.client.send("direct_message", {"target_name": name, "msg": message}):
-                self._write(f"You -> {name}: {message}\n", "self")
-        elif target.startswith("Group: "):
-            name = target[7:]
-            if self.client.send("group_message", {"group": name, "msg": message}):
-                self._write(f"You -> [{name}]: {message}\n", "self")
-        elif target == "Gemini":
-            if self.client.send("ask_gemini", {"prompt": message}):
-                self._write(f"You -> Gemini: {message}\n", "self")
+            return False
+        if kind == "user":
+            sent = self.client.send("direct_message", {"target_name": name, "msg": message})
+        elif kind == "group":
+            sent = self.client.send("group_message", {"group": name, "msg": message})
+        elif kind == "gemini":
+            sent = self.client.send("ask_gemini", {"prompt": message})
         else:
-            messagebox.showinfo("Choose a recipient", "Double-click a user or group, or choose Gemini from the To list.")
-            return
-        self.message_var.set("")
+            return False
+        if sent:
+            self._open_conversation(kind, name).append(f"You: {message}\n", "self")
+        return sent
 
     def _refresh_all(self) -> None:
         if self.client.connected:
+            self._refresh_contacts()
+            self.client.send("list_direct_files", None)
+
+    def _refresh_contacts(self, update_status: bool = True) -> None:
+        if self.client.connected:
             self.client.send("list_users", None)
             self.client.send("list_groups", None)
-            self.client.send("list_direct_files", None)
+            if update_status:
+                self.status_var.set("Users and groups refreshed")
+
+    def _auto_refresh_contacts(self) -> None:
+        if self.client.connected:
+            self._refresh_contacts(update_status=False)
+        self.after(5000, self._auto_refresh_contacts)
 
     def _create_group(self) -> None:
         name = simpledialog.askstring("Create group", "Group name:", parent=self)
@@ -400,7 +498,10 @@ class ChatWindow(tk.Tk):
         if not name:
             messagebox.showinfo("Leave group", "Select a group first.")
         else:
-            self.client.send("leave_group", {"group": name})
+            self._leave_named_group(name)
+
+    def _leave_named_group(self, name: str) -> None:
+        self.client.send("leave_group", {"group": name})
 
     def _remove_group(self) -> None:
         name = self._selected(self.groups_list)
@@ -410,16 +511,28 @@ class ChatWindow(tk.Tk):
     def _list_group_files(self) -> None:
         group = self._selected(self.groups_list)
         if group:
-            self.target_var.set(f"Group: {group}")
-            self.client.send("list_group_files", {"group": group})
-            self.notebook.select(2)
-            self.status_var.set(f"Showing files for group: {group}")
+            self._list_named_group_files(group)
+
+    def _list_named_group_files(self, group: str) -> None:
+        self.active_files_group = group
+        self.client.send("list_group_files", {"group": group})
+        self.notebook.select(2)
+        self.status_var.set(f"Showing files for group: {group}")
 
     def _send_file(self) -> None:
-        target = self.target_var.get()
-        if not (target.startswith("User: ") or target.startswith("Group: ")):
+        tab = self.notebook.index(self.notebook.select())
+        kind = "user" if tab == 0 else "group" if tab == 1 else ""
+        self._send_file_to_selected(kind)
+
+    def _send_file_to_selected(self, kind: str) -> None:
+        box = self.users_list if kind == "user" else self.groups_list if kind == "group" else None
+        name = self._selected(box) if box is not None else None
+        if not name:
             messagebox.showinfo("Send file", "Select a user or group first.")
             return
+        self._send_file_to(kind, name)
+
+    def _send_file_to(self, kind: str, name: str) -> None:
         path_text = filedialog.askopenfilename(parent=self, title="Send file")
         if not path_text:
             return
@@ -429,11 +542,11 @@ class ChatWindow(tk.Tk):
         except OSError as exc:
             messagebox.showerror("Send file", str(exc))
             return
-        if target.startswith("User: "):
-            payload = {"target_name": target[6:], "file_name": path.name, "data": data}
+        if kind == "user":
+            payload = {"target_name": name, "file_name": path.name, "data": data}
             self.client.send("direct_send_file", payload)
-        elif target.startswith("Group: "):
-            payload = {"group": target[7:], "file_name": path.name, "data": data}
+        elif kind == "group":
+            payload = {"group": name, "file_name": path.name, "data": data}
             self.client.send("group_send_file", payload)
 
     def _download_file(self) -> None:
@@ -472,7 +585,9 @@ class ChatWindow(tk.Tk):
             messagebox.showerror("Summarize PDF", str(exc))
             return
         self.client.send("pdf_sumarize", {"data": data})
-        self._write(f"Sent {Path(path_text).name} for summarization.\n", "system")
+        self._open_conversation("gemini", "Gemini").append(
+            f"Sent {Path(path_text).name} for summarization.\n", "system"
+        )
 
     def _generate_image(self) -> None:
         prompt = simpledialog.askstring("Generate image", "Describe the image:", parent=self)
@@ -487,26 +602,22 @@ class ChatWindow(tk.Tk):
         name = Path(destination).name
         self.pending_downloads[(name, None)] = Path(destination)
         self.client.send("generate_image", {"file_name": name, "prompt": prompt})
+        self._open_conversation("gemini", "Gemini").append(
+            f"Generating image: {prompt}\n", "system"
+        )
 
     def _show_help(self) -> None:
         messagebox.showinfo(
             "Command help",
-            "Double-click a user or group to make it the message destination.\n"
-            "Press Enter in the message field to send.\n\n"
+            "Double-click a user or group to open a separate conversation window.\n"
+            "Each conversation stays open independently; press Enter to send.\n\n"
+            "Gemini has chat, PDF summary, and image generation in one window.\n"
             "Use the File, Chat, Groups, and Tools menus—or right-click a list item—"
             "for all other commands. Press F5 to refresh the lists.",
         )
 
-    def _clear_transcript(self) -> None:
-        self.transcript.configure(state="normal")
-        self.transcript.delete("1.0", "end")
-        self.transcript.configure(state="disabled")
-
     def _write(self, text: str, tag: str | None = None) -> None:
-        self.transcript.configure(state="normal")
-        self.transcript.insert("end", text, tag or ())
-        self.transcript.see("end")
-        self.transcript.configure(state="disabled")
+        self._open_conversation("server", "Server").append(text, tag)
 
     @staticmethod
     def _address(data) -> str:
@@ -518,12 +629,6 @@ class ChatWindow(tk.Tk):
         box.delete(0, "end")
         for value in values:
             box.insert("end", value)
-
-    def _update_targets(self) -> None:
-        values = ["Server", "Gemini"]
-        values += [f"User: {self.users_list.get(i)}" for i in range(self.users_list.size())]
-        values += [f"Group: {self.groups_list.get(i)}" for i in range(self.groups_list.size())]
-        self.target_box.configure(values=values)
 
     def _handle_response(self, response: dict) -> None:
         status = str(response.get("status", ""))
@@ -537,22 +642,26 @@ class ChatWindow(tk.Tk):
         elif status == "101":
             names = [item[0] for item in (data or []) if item and item[0] != self.username]
             self._replace_list(self.users_list, names)
-            self._update_targets()
         elif status == "111":
             self._replace_list(self.groups_list, data or [])
-            self._update_targets()
         elif status in {"121", "131"}:
-            self.active_files_group = None if status == "121" else (
-                self.target_var.get()[7:] if self.target_var.get().startswith("Group: ") else None
-            )
+            if status == "121":
+                self.active_files_group = None
             self._replace_list(self.files_list, data or [])
         elif status == "201" and isinstance(data, dict):
-            self._write(f"{data.get('from')}@{self._address(data.get('addr'))}: {data.get('msg', '')}\n")
+            sender = str(data.get("from", "Unknown"))
+            window = self._open_conversation("user", sender)
+            window.append(f"{sender}@{self._address(data.get('addr'))}: {data.get('msg', '')}\n")
         elif status == "331" and isinstance(data, dict):
-            self._write(f"[{data.get('group')}] {data.get('from')}: {data.get('msg', '')}\n")
+            group_name = str(data.get("group", "Unknown group"))
+            window = self._open_conversation("group", group_name)
+            window.append(f"{data.get('from')}: {data.get('msg', '')}\n")
         elif status in {"401", "431"} and isinstance(data, dict):
-            group = f" in [{data.get('group')}]" if data.get("group") else ""
-            self._write(f"{data.get('from')} sent {data.get('file_name')}{group}.\n", "system")
+            kind = "group" if data.get("group") else "user"
+            name = str(data.get("group") or data.get("from") or "Unknown")
+            self._open_conversation(kind, name).append(
+                f"{data.get('from')} sent file: {data.get('file_name')}.\n", "system"
+            )
             self._refresh_all()
         elif status in {"411", "441", "511"} and isinstance(data, dict):
             group = self.active_files_group if status == "441" else None
@@ -574,13 +683,19 @@ class ChatWindow(tk.Tk):
                     import base64
                     raw = base64.b64decode(data.get("data", "")) if status == "511" else bytes.fromhex(data.get("data", ""))
                     destination.write_bytes(raw)
-                    self._write(f"Saved {destination}.\n", "system")
+                    if status == "511":
+                        self._open_conversation("gemini", "Gemini").append(
+                            f"Image saved to {destination}.\n", "system"
+                        )
+                    else:
+                        self._write(f"Saved {destination}.\n", "system")
                 except (OSError, ValueError) as exc:
                     messagebox.showerror("Save file", str(exc))
         elif status in {"501", "521"}:
             label = "Gemini summary" if status == "521" else "Gemini"
-            self._write(f"{label}:\n", "heading")
-            self._write(f"{data}\n")
+            window = self._open_conversation("gemini", "Gemini")
+            window.append(f"{label}:\n", "heading")
+            window.append(f"{data}\n")
         else:
             is_error = status in {"000", "200", "300", "310", "320", "330", "340", "400", "410", "420", "430", "440", "450", "500", "510", "520"}
             if isinstance(data, dict):

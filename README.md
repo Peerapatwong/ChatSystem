@@ -77,11 +77,14 @@ python gui_client.py
 Enter the host, port, and a unique user name, then choose **Connect**. The GUI
 keeps permanent controls to a minimum:
 
-- Double-click a user or group to select it as the message destination.
-- Type a message and press **Enter** (or choose **Send**).
+- Double-click a user or group to open its own independent chat window.
+- Open dedicated Gemini and server-log windows from the **Chat** menu.
+- Type a message and press **Enter** (or choose **Send**) in any chat window.
 - Right-click users, groups, or files for contextual actions.
-- Use the menu bar for group management, file transfer, Gemini, image creation,
-  and PDF summaries.
+- The Gemini window combines chat, image creation, and PDF summaries; private
+  and group windows include their relevant file and group actions.
+- The **Refresh** button reloads users and groups immediately; the GUI also
+  refreshes those two lists automatically every five seconds.
 - Press **F5** to refresh users, groups, and incoming files.
 
 The GUI uses only Python's standard library. On Linux, the optional OS package
