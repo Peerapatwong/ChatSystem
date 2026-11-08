@@ -64,6 +64,29 @@ Logging in successfully
 
 Then every command is a line starting with `/` and arguments after the slash are passed as JSON payloads.
 
+## Classic Windows GUI client
+
+The repository also includes a dependency-free Tkinter GUI with an old Windows
+look. Start the server, then launch the GUI in another terminal:
+
+```bash
+python server.py
+python gui_client.py
+```
+
+Enter the host, port, and a unique user name, then choose **Connect**. The GUI
+keeps permanent controls to a minimum:
+
+- Double-click a user or group to select it as the message destination.
+- Type a message and press **Enter** (or choose **Send**).
+- Right-click users, groups, or files for contextual actions.
+- Use the menu bar for group management, file transfer, Gemini, image creation,
+  and PDF summaries.
+- Press **F5** to refresh users, groups, and incoming files.
+
+The GUI uses only Python's standard library. On Linux, the optional OS package
+for Tk may need to be installed (often named `python3-tk`).
+
 ### Raw client → server request shape
 
 Each message is a **single JSON object**:
